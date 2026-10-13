@@ -169,7 +169,6 @@ func TestServerGRPC(t *testing.T) {
 		t.Errorf("expected task phase to be 'Running', got %q", resTask.Status.Phase)
 	}
 
-
 	// 5. Workspaces
 	ws, err = client.GetWorkspace(ctx, &v1alpha1.GetWorkspaceRequest{Atespace: "default", Name: "grpc-ws"})
 	if err != nil {
@@ -295,6 +294,14 @@ func TestCreateTask_ValidatesWorkspaceBindings(t *testing.T) {
 	}})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("expected InvalidArgument for colliding workspace paths, got %v", err)
+	}
+
+	for _, name := range []string{"a", "b"} {
+		if _, err := srv.UpdateWorkspace(ctx, &v1alpha1.UpdateWorkspaceRequest{Workspace: &v1alpha1.Workspace{
+			Metadata: &v1alpha1.ObjectMeta{Name: name},
+		}}); err != nil {
+			t.Fatalf("UpdateWorkspace(%s): %v", name, err)
+		}
 	}
 
 	_, err = srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{Task: &v1alpha1.Task{
