@@ -19,6 +19,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -65,7 +66,7 @@ func TestMetadataServer(t *testing.T) {
 		Spec:       &v1alpha1.WorkspaceSpec{},
 	}
 
-	srv := metadata.NewServer(9999, task, []*v1alpha1.Workspace{ws, ws2}, metadata.ServerOptions{MetadataPort: 9997})
+	srv := metadata.NewServer(0, task, []*v1alpha1.Workspace{ws, ws2})
 	if err := srv.Start(); err != nil {
 		t.Fatalf("failed to start server: %v", err)
 	}
@@ -75,7 +76,7 @@ func TestMetadataServer(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Test /healthz
-	resp, err := http.Get("http://127.0.0.1:9999/healthz")
+	resp, err := http.Get("http://" + srv.ProbeAddr() + "/healthz")
 	if err != nil {
 		t.Fatalf("healthz request failed: %v", err)
 	}
@@ -84,7 +85,7 @@ func TestMetadataServer(t *testing.T) {
 	}
 
 	// Test /readyz before workspace ready
-	resp, err = http.Get("http://127.0.0.1:9999/readyz")
+	resp, err = http.Get("http://" + srv.ProbeAddr() + "/readyz")
 	if err != nil {
 		t.Fatalf("readyz request failed: %v", err)
 	}
@@ -96,7 +97,7 @@ func TestMetadataServer(t *testing.T) {
 	srv.SetWorkspaceReady(true)
 
 	// Test /readyz after workspace ready
-	resp, err = http.Get("http://127.0.0.1:9999/readyz")
+	resp, err = http.Get("http://" + srv.ProbeAddr() + "/readyz")
 	if err != nil {
 		t.Fatalf("readyz request failed: %v", err)
 	}
@@ -143,7 +144,7 @@ func TestMetadataServer(t *testing.T) {
 	}
 
 	// Test multiplexed gRPC ProcessService on the same port
-	grpcConn, err := grpc.NewClient("127.0.0.1:9999", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	grpcConn, err := grpc.NewClient(srv.ProbeAddr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("dialing gRPC: %v", err)
 	}
@@ -170,7 +171,7 @@ func TestMetadataServer_GuestServicesRequireDebug(t *testing.T) {
 		Spec:     &v1alpha1.TaskSpec{Image: "ghcr.io/test/img"},
 	}
 
-	srv := metadata.NewServer(9998, task, nil, metadata.ServerOptions{MetadataPort: 9996})
+	srv := metadata.NewServer(0, task, nil)
 	if err := srv.Start(); err != nil {
 		t.Fatalf("failed to start server: %v", err)
 	}
@@ -188,7 +189,7 @@ func TestMetadataServer_GuestServicesRequireDebug(t *testing.T) {
 	}
 
 	// Guest gRPC is not served.
-	grpcConn, err := grpc.NewClient("127.0.0.1:9998", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	grpcConn, err := grpc.NewClient(srv.ProbeAddr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("failed to create grpc client: %v", err)
 	}
@@ -210,20 +211,24 @@ func TestMetadataServer_MetadataOnlyOnLoopback(t *testing.T) {
 		Spec:     &v1alpha1.TaskSpec{Image: "ghcr.io/test/img"},
 	}
 
-	srv := metadata.NewServer(9995, task, nil, metadata.ServerOptions{MetadataPort: 9994})
+	srv := metadata.NewServer(0, task, nil)
 	if err := srv.Start(); err != nil {
 		t.Fatalf("failed to start server: %v", err)
 	}
 	defer srv.Stop(context.Background())
 	time.Sleep(100 * time.Millisecond)
 
-	if got, want := srv.MetadataURL(), "http://127.0.0.1:9994"; got != want {
-		t.Errorf("MetadataURL() = %q, want %q", got, want)
+	metadataHost, metadataPort, err := net.SplitHostPort(strings.TrimPrefix(srv.MetadataURL(), "http://"))
+	if err != nil {
+		t.Fatalf("parsing MetadataURL %q: %v", srv.MetadataURL(), err)
+	}
+	if metadataHost != "127.0.0.1" {
+		t.Errorf("metadata listener bound to %q, want 127.0.0.1", metadataHost)
 	}
 
 	// The metadata endpoints are not served on the probe port.
 	for _, path := range []string{"/metadata/v1alpha1/ax/task", "/metadata/v1alpha1/ax/workspaces"} {
-		resp, err := http.Get("http://127.0.0.1:9995" + path)
+		resp, err := http.Get("http://" + srv.ProbeAddr() + path)
 		if err != nil {
 			t.Fatalf("request to probe port failed: %v", err)
 		}
@@ -245,7 +250,7 @@ func TestMetadataServer_MetadataOnlyOnLoopback(t *testing.T) {
 			continue
 		}
 		checked = true
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ipNet.IP.String(), "9994"), time.Second)
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ipNet.IP.String(), metadataPort), time.Second)
 		if err == nil {
 			conn.Close()
 			t.Errorf("metadata port accepted a connection on %s", ipNet.IP)

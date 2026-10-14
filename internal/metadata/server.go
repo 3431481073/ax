@@ -30,20 +30,16 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// DefaultMetadataPort is the loopback port the metadata endpoints listen on when
-// ServerOptions.MetadataPort is unset.
-const DefaultMetadataPort = 8099
-
 // Server is the cloud-style metadata server running inside the task actor container.
 // It runs two listeners. The probe listener on all interfaces serves /healthz and
 // /readyz, multiplexed with the guest gRPC services when debug is enabled. The
 // metadata listener serves the /metadata endpoints on loopback only, so they are
 // reachable from inside the container and nowhere else.
 type Server struct {
-	port           int
-	metadataPort   int
 	server         *http.Server
 	metadataServer *http.Server
+	probeAddr      string // bound address of the probe listener, set by Start
+	metadataAddr   string // bound address of the metadata listener, set by Start
 	grpcServer     *grpc.Server
 	grpcCleanup    func()
 	mu             sync.RWMutex
@@ -56,32 +52,24 @@ type Server struct {
 type ServerOptions struct {
 	WorkspacePath string
 	LogDir        string
-	// MetadataPort is the loopback port for the /metadata endpoints. Zero means
-	// DefaultMetadataPort.
+	// MetadataPort is the loopback port for the /metadata endpoints. Zero picks
+	// a free port; read the result from MetadataURL after Start.
 	MetadataPort int
 }
 
 // NewServer creates a new metadata and guest server serving the task and its
 // bound workspaces, in the task's declaration order. Nil workspaces are dropped.
 // port is the probe and guest port; the metadata endpoints use
-// ServerOptions.MetadataPort on loopback.
+// ServerOptions.MetadataPort on loopback. A zero port picks a free one; read
+// the result from ProbeAddr or MetadataURL after Start.
 func NewServer(port int, task *v1alpha1.Task, workspaces []*v1alpha1.Workspace, opts ...ServerOptions) *Server {
-	if port <= 0 {
-		port = 9999
-	}
 	var opt ServerOptions
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
-	metadataPort := opt.MetadataPort
-	if metadataPort <= 0 {
-		metadataPort = DefaultMetadataPort
-	}
 	s := &Server{
-		port:         port,
-		metadataPort: metadataPort,
-		task:         task,
-		workspaces:   compactWorkspaces(workspaces),
+		task:       task,
+		workspaces: compactWorkspaces(workspaces),
 	}
 
 	// Guest services expose process execution and file access inside the container,
@@ -136,17 +124,26 @@ func NewServer(port int, task *v1alpha1.Task, workspaces []*v1alpha1.Workspace, 
 	metadataMux.HandleFunc("/metadata/v1alpha1/ax/workspaces", s.handleWorkspaces)
 
 	s.metadataServer = &http.Server{
-		Addr:    net.JoinHostPort("127.0.0.1", fmt.Sprint(metadataPort)),
+		Addr:    net.JoinHostPort("127.0.0.1", fmt.Sprint(opt.MetadataPort)),
 		Handler: metadataMux,
 	}
 
 	return s
 }
 
+// ProbeAddr is the address the probe and guest listener is bound to. It is
+// empty until Start succeeds.
+func (s *Server) ProbeAddr() string {
+	return s.probeAddr
+}
+
 // MetadataURL is the base URL of the metadata endpoints, as handed to the task
-// command in AX_METADATA_URL.
+// command in AX_METADATA_URL. It is empty until Start succeeds.
 func (s *Server) MetadataURL() string {
-	return "http://" + s.metadataServer.Addr
+	if s.metadataAddr == "" {
+		return ""
+	}
+	return "http://" + s.metadataAddr
 }
 
 // Start begins serving the probe, guest, and metadata endpoints in background goroutines.
@@ -161,8 +158,10 @@ func (s *Server) Start() error {
 		return fmt.Errorf("metadata server listening on %s: %w", s.metadataServer.Addr, err)
 	}
 
-	slog.Info("probe and guest server started", "addr", s.server.Addr)
-	slog.Info("metadata server started", "addr", s.metadataServer.Addr)
+	s.probeAddr = lis.Addr().String()
+	s.metadataAddr = metadataLis.Addr().String()
+	slog.Info("probe and guest server started", "addr", s.probeAddr)
+	slog.Info("metadata server started", "addr", s.metadataAddr)
 
 	go func() {
 		if err := s.server.Serve(lis); err != nil && !errors.Is(err, http.ErrServerClosed) {

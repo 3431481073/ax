@@ -42,7 +42,7 @@ const (
 	DefaultPort = 80
 	// DefaultMetadataPort is the loopback port for the metadata endpoints when
 	// Config.MetadataPort is zero.
-	DefaultMetadataPort = metadata.DefaultMetadataPort
+	DefaultMetadataPort = 8099
 	// DefaultWorkspacePath is the command's working directory when the task
 	// binds no workspaces.
 	DefaultWorkspacePath = v1alpha1.DefaultWorkspacePath
@@ -127,6 +127,10 @@ func Run(ctx context.Context, cfg Config) error {
 	if port <= 0 {
 		port = DefaultPort
 	}
+	metadataPort := cfg.MetadataPort
+	if metadataPort <= 0 {
+		metadataPort = DefaultMetadataPort
+	}
 	mounts := resolveMounts(cfg)
 	if len(mounts) == 0 {
 		// Nothing bound: still provide an empty working directory at the default path.
@@ -145,16 +149,15 @@ func Run(ctx context.Context, cfg Config) error {
 
 	metaServer := metadata.NewServer(port, cfg.Task, workspaces, metadata.ServerOptions{
 		WorkspacePath: wsPath,
-		MetadataPort:  cfg.MetadataPort,
+		MetadataPort:  metadataPort,
 	})
+	if err := metaServer.Start(); err != nil {
+		return fmt.Errorf("starting metadata server: %w", err)
+	}
 	metadataURL := metaServer.MetadataURL()
 	_ = os.Setenv("AX_METADATA_URL", metadataURL)
 	for _, e := range cfg.Task.GetSpec().GetEnv() {
 		_ = os.Setenv(e.GetName(), e.GetValue())
-	}
-
-	if err := metaServer.Start(); err != nil {
-		return fmt.Errorf("starting metadata server: %w", err)
 	}
 	defer func() {
 		slog.Info("shutting down metadata server")
