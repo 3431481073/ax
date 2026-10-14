@@ -183,7 +183,14 @@ func (s *Server) Stop(ctx context.Context) error {
 	if s.grpcCleanup != nil {
 		s.grpcCleanup()
 	}
-	return errors.Join(s.server.Shutdown(ctx), s.metadataServer.Shutdown(ctx))
+	// Shut both servers down concurrently so one draining its connections does
+	// not hold the other open or use up ctx's deadline.
+	var wg sync.WaitGroup
+	var probeErr, metadataErr error
+	wg.Go(func() { probeErr = s.server.Shutdown(ctx) })
+	wg.Go(func() { metadataErr = s.metadataServer.Shutdown(ctx) })
+	wg.Wait()
+	return errors.Join(probeErr, metadataErr)
 }
 
 // UpdateState allows dynamic updates to the current Task and Workspaces.
