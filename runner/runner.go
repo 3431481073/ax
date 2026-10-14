@@ -37,9 +37,12 @@ import (
 )
 
 const (
-	// DefaultPort is where the metadata and guest server listens when Config.Port
+	// DefaultPort is where the probe and guest server listens when Config.Port
 	// is zero. It matches the port Agent Substrate probes for readiness.
 	DefaultPort = 80
+	// DefaultMetadataPort is the loopback port for the metadata endpoints when
+	// Config.MetadataPort is zero.
+	DefaultMetadataPort = metadata.DefaultMetadataPort
 	// DefaultWorkspacePath is the command's working directory when the task
 	// binds no workspaces.
 	DefaultWorkspacePath = v1alpha1.DefaultWorkspacePath
@@ -51,9 +54,12 @@ const (
 
 // Config controls a single Run.
 type Config struct {
-	// Port is where the metadata HTTP endpoints and guest gRPC services listen.
+	// Port is where the probe endpoints and guest gRPC services listen.
 	// Zero means DefaultPort.
 	Port int
+	// MetadataPort is the loopback-only port for the metadata endpoints the task
+	// command reads through AX_METADATA_URL. Zero means DefaultMetadataPort.
+	MetadataPort int
 	// Task is the task to run. It supplies the command, its environment, and
 	// the workspace bindings. Nil runs with no command and default settings.
 	Task *v1alpha1.Task
@@ -137,13 +143,16 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	slog.Info("initializing AX task runner", "port", port, "wsPath", wsPath, "workspaces", paths)
 
-	metadataURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	metaServer := metadata.NewServer(port, cfg.Task, workspaces, metadata.ServerOptions{
+		WorkspacePath: wsPath,
+		MetadataPort:  cfg.MetadataPort,
+	})
+	metadataURL := metaServer.MetadataURL()
 	_ = os.Setenv("AX_METADATA_URL", metadataURL)
 	for _, e := range cfg.Task.GetSpec().GetEnv() {
 		_ = os.Setenv(e.GetName(), e.GetValue())
 	}
 
-	metaServer := metadata.NewServer(port, cfg.Task, workspaces, metadata.ServerOptions{WorkspacePath: wsPath})
 	if err := metaServer.Start(); err != nil {
 		return fmt.Errorf("starting metadata server: %w", err)
 	}
@@ -176,7 +185,7 @@ func Run(ctx context.Context, cfg Config) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = commandEnv(cfg.Task, port)
+	cmd.Env = commandEnv(cfg.Task, metadataURL)
 	// A dedicated process group lets shutdown signal the command together with
 	// anything it spawned.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -237,8 +246,8 @@ func reportExit(cfg Config, cmd *exec.Cmd, err error) {
 
 // commandEnv builds the environment for the task command: the runner's own
 // environment, the metadata URL, and the Task's spec.env entries.
-func commandEnv(task *v1alpha1.Task, port int) []string {
-	env := append(os.Environ(), fmt.Sprintf("AX_METADATA_URL=http://127.0.0.1:%d", port))
+func commandEnv(task *v1alpha1.Task, metadataURL string) []string {
+	env := append(os.Environ(), "AX_METADATA_URL="+metadataURL)
 	for _, e := range task.GetSpec().GetEnv() {
 		env = append(env, fmt.Sprintf("%s=%s", e.GetName(), e.GetValue()))
 	}
