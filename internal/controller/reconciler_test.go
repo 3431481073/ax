@@ -393,6 +393,140 @@ func TestTaskReconciler_SuspendError(t *testing.T) {
 	assertCondition(t, reconciled, "Ready", "True", "TaskRunning")
 }
 
+// TestTaskReconciler_TemplateCreationFailed covers google/ax#366: when Substrate
+// rejects the per-task ActorTemplate (for example because the image is referenced
+// by tag rather than digest), the task must report that error directly instead of
+// silently falling back to the default template.
+func TestTaskReconciler_TemplateCreationFailed(t *testing.T) {
+	ctx := t.Context()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer lis.Close()
+
+	const substrateMsg = `actor_template.containers[0].image: Invalid value: "localhost:5001/my-agent:v1": must be pinned by digest (changing the image invalidates snapshots)`
+	mockSrv := &mockControlServer{
+		createTemplateErr: status.Error(codes.InvalidArgument, substrateMsg),
+	}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("failed to create substrate client: %v", err)
+	}
+	defer client.Close()
+
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	reconciler.SecretResolver = noSecrets
+	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
+
+	task := &v1alpha1.Task{
+		ApiVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindTask,
+		Metadata: &v1alpha1.ObjectMeta{
+			Name:     "tagged-image",
+			Atespace: "default",
+		},
+		Spec: &v1alpha1.TaskSpec{
+			Image:   "localhost:5001/my-agent:v1",
+			Command: []string{"python3", "/app/agent.py"},
+		},
+		Status: &v1alpha1.TaskStatus{Phase: "Running"},
+	}
+
+	reconciled, err := reconciler.Reconcile(ctx, task, nil)
+	if err == nil {
+		t.Fatal("expected Reconcile to fail when the ActorTemplate cannot be created")
+	}
+	if !strings.Contains(err.Error(), "must be pinned by digest") {
+		t.Errorf("expected error to carry the Substrate message, got %v", err)
+	}
+
+	if reconciled.Status.Phase != "Failed" {
+		t.Errorf("expected phase 'Failed', got %q", reconciled.Status.Phase)
+	}
+	assertCondition(t, reconciled, "Ready", "False", "TemplateCreationFailed")
+	for _, c := range reconciled.Status.Conditions {
+		if c.Type != "Ready" {
+			continue
+		}
+		// The user-facing message should be exactly what Substrate said, without the
+		// "rpc error: code = ... desc = " wrapper or our internal context prefix.
+		if c.Message != substrateMsg {
+			t.Errorf("expected Ready message to be the bare Substrate error\n got: %q\nwant: %q", c.Message, substrateMsg)
+		}
+	}
+
+	// The reconcile must stop before touching the actor: no fallback to the default template.
+	if len(mockSrv.createdActors) != 0 {
+		t.Errorf("expected no actor to be created, got %v", mockSrv.createdActors)
+	}
+	if len(mockSrv.resumedActors) != 0 {
+		t.Errorf("expected no actor to be resumed, got %v", mockSrv.resumedActors)
+	}
+}
+
+// TestTaskReconciler_TemplateCreationTransient checks that a transient Substrate
+// error during ActorTemplate creation (for example Unavailable after retries are
+// exhausted) leaves the task Pending for a later retry rather than permanently Failed.
+func TestTaskReconciler_TemplateCreationTransient(t *testing.T) {
+	ctx := t.Context()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer lis.Close()
+
+	// DeadlineExceeded is transient per substrate.IsTransientError but is not in the
+	// client's retry list, so the test does not wait out the Unavailable backoff.
+	mockSrv := &mockControlServer{
+		createTemplateErr: status.Error(codes.DeadlineExceeded, "substrate control plane timed out"),
+	}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("failed to create substrate client: %v", err)
+	}
+	defer client.Close()
+
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	reconciler.SecretResolver = noSecrets
+	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
+
+	task := &v1alpha1.Task{
+		ApiVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindTask,
+		Metadata: &v1alpha1.ObjectMeta{
+			Name:     "template-transient",
+			Atespace: "default",
+		},
+		Spec:   &v1alpha1.TaskSpec{Image: "ghcr.io/my-org/my-agent@sha256:0000000000000000000000000000000000000000000000000000000000000000"},
+		Status: &v1alpha1.TaskStatus{Phase: "Running"},
+	}
+
+	reconciled, err := reconciler.Reconcile(ctx, task, nil)
+	if err == nil {
+		t.Fatal("expected Reconcile to return an error on transient template failure")
+	}
+	if reconciled.Status.Phase != "Pending" {
+		t.Errorf("expected phase 'Pending', got %q", reconciled.Status.Phase)
+	}
+	assertCondition(t, reconciled, "Ready", "False", "SubstrateUnavailable")
+	if len(mockSrv.createdActors) != 0 {
+		t.Errorf("expected no actor to be created, got %v", mockSrv.createdActors)
+	}
+}
+
 func TestTaskReconciler_WorkspaceReady(t *testing.T) {
 	ctx := context.Background()
 
@@ -682,23 +816,24 @@ func TestTaskReconciler_ResourceLimitsFailurePaths(t *testing.T) {
 		}
 	})
 
-	t.Run("rejected template without limits still falls back", func(t *testing.T) {
+	t.Run("rejected template without limits does not fall back either", func(t *testing.T) {
 		mockSrv := &mockControlServer{
 			createTemplateErr: status.Error(codes.InvalidArgument, "image must be pinned by digest"),
 		}
 		reconciler := setup(t, mockSrv)
 
 		reconciled, err := reconciler.Reconcile(ctx, newTask("no-limits", nil), nil)
-		if err != nil {
-			t.Fatalf("Reconcile without limits failed: %v", err)
+		if err == nil {
+			t.Fatal("Reconcile succeeded although the template was rejected")
 		}
-		// A fresh task is provisioned on the fallback template and then
-		// suspended until it is executed.
-		if reconciled.Status.Phase != "Suspended" {
-			t.Errorf("phase = %q, want Suspended", reconciled.Status.Phase)
+		// Falling back would run a different image than the task asked for, so the
+		// template error is terminal regardless of whether limits are set (#366).
+		if reconciled.Status.Phase != "Failed" {
+			t.Errorf("phase = %q, want Failed", reconciled.Status.Phase)
 		}
-		if len(mockSrv.createdActors) != 1 {
-			t.Errorf("fallback did not create the actor: %v", mockSrv.createdActors)
+		assertCondition(t, reconciled, "Ready", "False", "TemplateCreationFailed")
+		if len(mockSrv.createdActors) != 0 {
+			t.Errorf("task ran on a fallback template: actors=%v", mockSrv.createdActors)
 		}
 	})
 }

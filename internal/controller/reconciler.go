@@ -191,16 +191,21 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, ws 
 		// spec.resources rides along in AX_TASK_YAML, so a limits change is already
 		// part of the template digest and re-provisions the template.
 		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, resources, extraEnv)
-		if err != nil && resources != nil {
-			// The default template does not carry the task's limits, so falling back
-			// would silently run the task unconstrained.
-			r.setNotReady(task, "TemplateCreationFailed", err.Error(), now)
+		if err != nil {
+			if substrate.IsTransientError(err) {
+				r.setNotReady(task, "SubstrateUnavailable", err.Error(), now)
+				task.Status.Phase = "Pending"
+				return task, fmt.Errorf("ensuring actor template: %w", err)
+			}
+			// Falling back to the default template would run a different image than
+			// the user asked for, without the limits it asked for, or fail later with
+			// a misleading "actor template not found". Surface the real error on the
+			// task and stop here.
+			r.setNotReady(task, "TemplateCreationFailed", substrateErrorMessage(err), now)
 			task.Status.Phase = "Failed"
 			return task, fmt.Errorf("ensuring actor template: %w", err)
 		}
-		if err != nil {
-			slog.Warn("could not create custom ActorTemplate, falling back to default template", "error", err)
-		} else if tmpl != nil && tmpl.Metadata != nil {
+		if tmpl != nil && tmpl.Metadata != nil {
 			templateAtespace = tmpl.Metadata.Atespace
 			templateName = tmpl.Metadata.Name
 			slog.Info("using custom ActorTemplate for actor", "templateAtespace", templateAtespace, "templateName", templateName)
@@ -360,6 +365,23 @@ func (r *TaskReconciler) conditionTrue(task *v1alpha1.Task, condType string) boo
 		}
 	}
 	return false
+}
+
+// substrateErrorMessage returns the message to show users for a failed Substrate call.
+// Substrate errors reach the reconciler wrapped (fmt.Errorf("...: %w", grpcErr)), and
+// status.Convert on a wrapped error yields the full err.Error() including the
+// "rpc error: code = ... desc = " boilerplate. Unwrapping to the underlying gRPC
+// status recovers just the description Substrate wrote, e.g.
+// `actor_template.containers[0].image: Invalid value: "...": must be pinned by digest`.
+// Non-gRPC errors are returned verbatim.
+func substrateErrorMessage(err error) string {
+	var gs interface{ GRPCStatus() *status.Status }
+	if errors.As(err, &gs) {
+		if s := gs.GRPCStatus(); s != nil && s.Message() != "" {
+			return s.Message()
+		}
+	}
+	return err.Error()
 }
 
 func (r *TaskReconciler) setCondition(task *v1alpha1.Task, condType, status, reason, message string, t time.Time) {
