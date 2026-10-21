@@ -32,6 +32,7 @@ import (
 
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	"github.com/google/ax/runner"
+	"google.golang.org/protobuf/proto"
 	"gopkg.in/yaml.v3"
 )
 
@@ -73,8 +74,10 @@ func main() {
 }
 
 // loadSpec decodes YAML into out from file when set, otherwise from the named
-// environment variable. It is not an error for neither to be present.
-func loadSpec(file, envVar string, out any) error {
+// environment variable. It is not an error for neither to be present, or for
+// the YAML to be blank. Unknown fields are ignored, so a runner image keeps
+// working with a newer control plane.
+func loadSpec(file, envVar string, out proto.Message) error {
 	var raw []byte
 	switch {
 	case file != "":
@@ -88,7 +91,14 @@ func loadSpec(file, envVar string, out any) error {
 	default:
 		return nil
 	}
-	if err := yaml.Unmarshal(raw, out); err != nil {
+	var node yaml.Node
+	if err := yaml.Unmarshal(raw, &node); err != nil {
+		return fmt.Errorf("parsing %T: %w", out, err)
+	}
+	if len(node.Content) == 0 || node.Content[0].ShortTag() == "!!null" {
+		return nil
+	}
+	if err := v1alpha1.UnmarshalYAMLLenient(node.Content[0], out); err != nil {
 		return fmt.Errorf("parsing %T: %w", out, err)
 	}
 	return nil
