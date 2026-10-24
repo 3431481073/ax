@@ -17,9 +17,12 @@ SHELL := /bin/bash
 # Configuration
 AX_IMAGE_REPO ?= gcr.io/ax-substrate/ate-images
 TASK_RUNNER_REPO ?= $(AX_IMAGE_REPO)/ax-task-runner
+CLAUDE_CODE_REPO ?= gcr.io/ax-images/ax-images
+CLAUDE_CODE_VERSION ?= latest
+CLAUDE_CODE_BASE_IMAGE ?=
 CONTAINER_CLI ?= $(shell which podman 2>/dev/null || which docker 2>/dev/null)
 
-.PHONY: all build build-binaries build-task-runner install push push-task-runner deploy deploy-server deploy-redis apply-example test test-e2e test-e2e-head e2e-setup e2e-run e2e-cleanup clean
+.PHONY: all build build-binaries build-task-runner build-claude-code-image install push push-task-runner push-claude-code-image deploy deploy-server deploy-redis apply-example test test-e2e test-e2e-head e2e-setup e2e-run e2e-cleanup clean
 
 all: build
 
@@ -55,6 +58,18 @@ push-task-runner: build-task-runner
 	$(CONTAINER_CLI) push $(TASK_RUNNER_REPO):latest
 	@echo "==> Current pushed digest:"
 	@gcloud container images list-tags $(TASK_RUNNER_REPO) --filter="tags=latest" --format="get(digest)"
+
+# Build a task image with Claude Code preinstalled, on top of the default runner image
+build-claude-code-image:
+	@echo "==> Building container image $(CLAUDE_CODE_REPO):latest (Claude Code $(CLAUDE_CODE_VERSION)) using $(CONTAINER_CLI)..."
+	$(CONTAINER_CLI) build --platform linux/amd64 --build-arg CLAUDE_CODE_VERSION=$(CLAUDE_CODE_VERSION) $(if $(CLAUDE_CODE_BASE_IMAGE),--build-arg BASE_IMAGE=$(CLAUDE_CODE_BASE_IMAGE),) -t $(CLAUDE_CODE_REPO):latest -f Dockerfile.claude-code .
+
+# Push the Claude Code task image to the registry and print the digest to pin in spec.image
+push-claude-code-image: build-claude-code-image
+	@echo "==> Pushing Claude Code task image to $(CLAUDE_CODE_REPO):latest..."
+	$(CONTAINER_CLI) push $(CLAUDE_CODE_REPO):latest
+	@echo "==> Current pushed digest:"
+	@gcloud container images list-tags $(CLAUDE_CODE_REPO) --filter="tags=latest" --format="get(digest)"
 
 # Build and push all images
 push: push-task-runner

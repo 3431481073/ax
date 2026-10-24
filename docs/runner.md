@@ -79,6 +79,8 @@ RUN npm install -g my-agent
 
 The runner binary stays at `/usr/local/bin/ax-task-runner`, so nothing else changes.
 
+For a working example that layers Claude Code onto the default image, see [`Dockerfile.claude-code`](../Dockerfile.claude-code). `make push-claude-code-image` builds it, pushes it, and prints the digest to pin in `spec.image`; [`examples/claude-code.yaml`](../examples/claude-code.yaml) is a Task that uses it. Build it on an amd64 host: the Claude Code installer runs the binary it downloads, which aborts under qemu emulation.
+
 ### 2. Embed the runner package in your own binary
 
 If you want the standard lifecycle but need to run code around it, import `github.com/google/ax/runner` and call `runner.Run` yourself. This gives you a hook for the command's exit and a place to do your own setup before or after the metadata server starts:
