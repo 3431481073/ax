@@ -29,6 +29,9 @@
 #   REGISTRY_ADDR            Local container registry address (default: localhost:5001)
 #   RECREATE_KIND            Set to true to delete and recreate the Kind cluster
 #   FORCE_INSTALL_SUBSTRATE  Set to true to reinstall Substrate even if the commit is unchanged
+#   SUBSTRATE_IMAGE_CACHE_DIR  Host directory backing the local registry's storage. When set,
+#                            Substrate images are published there once per Substrate version and
+#                            later installs reuse them instead of rebuilding from source.
 
 set -euo pipefail
 export GOWORK=off
@@ -50,7 +53,7 @@ SUBSTRATE_REPO="${SUBSTRATE_REPO:-https://github.com/agent-substrate/substrate.g
 GOARCH="$(go env GOARCH)"
 
 # Default to the Substrate version AX is built against. Go pseudo-versions
-SUBSTRATE_REF="${SUBSTRATE_REF:-$(cd "${REPO_ROOT}" && go list -m -f '{{.Version}}' github.com/agent-substrate/substrate)}"
+SUBSTRATE_REF="${SUBSTRATE_REF:-$(cd "${REPO_ROOT}" && (go list -m -f '{{.Version}}' go.ate.dev/substrate 2> /dev/null || go list -m -f '{{.Version}}' github.com/agent-substrate/substrate))}"
 if [[ "${SUBSTRATE_REF}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-.*-([0-9a-f]{12})$ ]]; then
   SUBSTRATE_REF="${BASH_REMATCH[1]}"
 fi
@@ -188,9 +191,97 @@ build_and_push() {
   docker inspect --format='{{index .RepoDigests 0}}' "${tag}"
 }
 
+# ensure_cached_registry runs Substrate's local registry container
+# (kind-registry, as created by Substrate's hack/create-kind-cluster.sh) with
+# its storage on SUBSTRATE_IMAGE_CACHE_DIR, so pushed images outlive the
+# container and can be cached between CI runs. create-kind-cluster.sh reuses a
+# running registry, so creating it first is enough.
+ensure_cached_registry() {
+  local name=kind-registry port="${REGISTRY_ADDR##*:}" mounted
+  mounted="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/lib/registry"}}{{.Source}}{{end}}{{end}}' "${name}" 2> /dev/null || true)"
+  if [[ "${mounted}" == "${SUBSTRATE_IMAGE_CACHE_DIR}" ]] &&
+    [[ "$(docker inspect -f '{{.State.Running}}' "${name}" 2> /dev/null)" == "true" ]]; then
+    return 0
+  fi
+  log "Starting registry '${name}' on port ${port} with storage at ${SUBSTRATE_IMAGE_CACHE_DIR}..."
+  docker rm -f "${name}" > /dev/null 2>&1 || true
+  docker run -d --restart=always \
+    --label created-by=agent-substrate \
+    -p "127.0.0.1:${port}:5000" -p "[::1]:${port}:5000" \
+    -v "${SUBSTRATE_IMAGE_CACHE_DIR}:/var/lib/registry" \
+    --network bridge --name "${name}" \
+    registry:3 > /dev/null
+  # Reattach to an existing Kind cluster's network; a new cluster does this itself.
+  if docker network inspect kind > /dev/null 2>&1; then
+    docker network connect kind "${name}" > /dev/null 2>&1 || true
+  fi
+  local _
+  for _ in $(seq 1 30); do
+    curl -fsS -o /dev/null "http://${REGISTRY_ADDR}/v2/" && return 0
+    sleep 1
+  done
+  echo "registry ${name} did not become ready at ${REGISTRY_ADDR}" >&2
+  return 1
+}
+
+# registry_digest prints the digest the local registry holds for image:tag, or
+# fails if it has none.
+registry_digest() {
+  curl -fsSI \
+    -H 'Accept: application/vnd.oci.image.index.v1+json' \
+    -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+    -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+    -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+    "http://${REGISTRY_ADDR}/v2/$1/manifests/$2" 2> /dev/null |
+    tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" { print $2; found = 1 } END { exit !found }'
+}
+
+# ensure_substrate_images publishes Substrate's release image set to the local
+# registry under SUBSTRATE_IMAGE_TAG unless it is already there (for example,
+# restored from the CI cache).
+ensure_substrate_images() {
+  local img missing=false
+  for img in ateapi atecontroller atelet atenet "${WORKER_IMAGE}" podcertcontroller objectstore-plugin envoy-dataplane; do
+    registry_digest "${img}" "${SUBSTRATE_IMAGE_TAG}" > /dev/null || { missing=true; break; }
+  done
+  if [[ "${missing}" == "false" ]]; then
+    log "Reusing cached Substrate images (tag ${SUBSTRATE_IMAGE_TAG}) from ${REGISTRY_ADDR}."
+    return 0
+  fi
+  log "Publishing Substrate images (tag ${SUBSTRATE_IMAGE_TAG}) to ${REGISTRY_ADDR}..."
+  (
+    cd "${SUBSTRATE_WORK_DIR}"
+    NO_DEV_ENV=true VERSION="${SUBSTRATE_IMAGE_TAG}" \
+      KO_DOCKER_REPO="${REGISTRY_ADDR}" KO_DEFAULTPLATFORMS="linux/${GOARCH}" \
+      go run ./cmd/ate-setup publish release-images
+  )
+}
+
+# The WorkerPool's ko:// worker image reference, and the image name Substrate
+# publishes it under (the last element of the import path).
+WORKER_KO_REF="$(awk '$1 == "workerImage:" { print $2; exit }' "${E2E_DIR}/manifests/workerpool.yaml")"
+WORKER_IMAGE="${WORKER_KO_REF##*/}"
+
 SUBSTRATE_WORK_DIR="$(resolve_substrate_dir)"
 SUBSTRATE_COMMIT="$(git -C "${SUBSTRATE_WORK_DIR}" rev-parse HEAD)"
 log "Using Substrate checkout at ${SUBSTRATE_WORK_DIR} (ref=${SUBSTRATE_REF}, commit=${SUBSTRATE_COMMIT:0:12})"
+
+# Pre-built Substrate images need a Substrate that can publish and install
+# them, and a clean checkout so the version tag identifies its contents.
+SUBSTRATE_IMAGE_TAG=""
+if [[ -n "${SUBSTRATE_IMAGE_CACHE_DIR:-}" ]]; then
+  SUBSTRATE_IMAGE_CACHE_DIR="$(mkdir -p "${SUBSTRATE_IMAGE_CACHE_DIR}" && cd "${SUBSTRATE_IMAGE_CACHE_DIR}" && pwd)"
+  if ! grep -q "publish release-images" "${SUBSTRATE_WORK_DIR}/cmd/ate-setup/commands.md" 2> /dev/null; then
+    log "Substrate ${SUBSTRATE_COMMIT:0:12} cannot install pre-built images; building from source."
+  elif [[ -n "$(git -C "${SUBSTRATE_WORK_DIR}" status --porcelain --untracked-files=no)" ]]; then
+    log "Substrate checkout has local changes; building from source instead of using cached images."
+  else
+    # Matches the version a source build stamps (git describe), so tagged
+    # releases keep their version and other commits are named by hash.
+    SUBSTRATE_IMAGE_TAG="$(git -C "${SUBSTRATE_WORK_DIR}" describe --tags --always)"
+    ensure_cached_registry
+  fi
+fi
 
 # 1. Ensure the Kind cluster and local registry exist.
 if [[ "${RECREATE_KIND:-false}" == "true" ]] || ! kind get clusters 2> /dev/null | grep -qx "${KIND_CLUSTER_NAME}"; then
@@ -200,6 +291,7 @@ else
   log "Reusing Kind cluster '${KIND_CLUSTER_NAME}' (set RECREATE_KIND=true to recreate)."
 fi
 kind export kubeconfig --name "${KIND_CLUSTER_NAME}" --kubeconfig "${KUBECONFIG}"
+docker exec "${KIND_CLUSTER_NAME}-control-plane" sysctl -w fs.inotify.max_user_instances=8192 > /dev/null 2>&1 || true
 
 # 2. Install Substrate unless the requested commit is already installed.
 INSTALLED_SUBSTRATE_COMMIT="$(k get namespace ate-system -o jsonpath='{.metadata.annotations.substrate-commit}' 2> /dev/null || true)"
@@ -211,12 +303,30 @@ if [[ "${FORCE_INSTALL_SUBSTRATE:-false}" == "true" ]] ||
     uninstall_substrate
   fi
 
-  install_args=(--deploy-ate-system --rollout-timeout="${SUBSTRATE_ROLLOUT_TIMEOUT:-3m}")
-  # Older Substrate versions do not have --credential-provider.
-  if grep -q -- "--credential-provider" "${SUBSTRATE_WORK_DIR}/hack/install-ate.sh" 2> /dev/null; then
-    install_args+=(--credential-provider='{"enabled":false}')
+  if [[ -d "${SUBSTRATE_WORK_DIR}/cmd/ate-setup" ]]; then
+    install_args=(
+      deploy ate-system
+      --rollout-timeout="${SUBSTRATE_ROLLOUT_TIMEOUT:-3m}"
+      --credential-provider='{"enabled":false}'
+      --ateapi-authz-bootstrap-owners="system:serviceaccount:ate-system:ate-client,system:serviceaccount:${AX_SYSTEM_NAMESPACE}:ax-server"
+      --ingress-allowed-spiffe-ids="spiffe://cluster.local/ns/${AX_SYSTEM_NAMESPACE}/sa/ax-server"
+    )
+  else
+    install_args=(--deploy-ate-system --rollout-timeout="${SUBSTRATE_ROLLOUT_TIMEOUT:-3m}")
+    # Older Substrate versions do not have --credential-provider.
+    if grep -q -- "--credential-provider" "${SUBSTRATE_WORK_DIR}/hack/install-ate.sh" 2> /dev/null; then
+      install_args+=(--credential-provider='{"enabled":false}')
+    fi
   fi
-  (cd "${SUBSTRATE_WORK_DIR}" && ./hack/install-ate-kind.sh "${install_args[@]}")
+  if [[ -n "${SUBSTRATE_IMAGE_TAG}" ]]; then
+    ensure_substrate_images
+    # install-ate.sh passes these settings to ate-setup through the environment.
+    (cd "${SUBSTRATE_WORK_DIR}" &&
+      ATE_IMAGE_REPO="${REGISTRY_ADDR}" ATE_IMAGE_TAG="${SUBSTRATE_IMAGE_TAG}" \
+        ./hack/install-ate-kind.sh "${install_args[@]}")
+  else
+    (cd "${SUBSTRATE_WORK_DIR}" && ./hack/install-ate-kind.sh "${install_args[@]}")
+  fi
   k annotate namespace ate-system "substrate-commit=${SUBSTRATE_COMMIT}" --overwrite > /dev/null
 else
   log "Substrate ${SUBSTRATE_COMMIT:0:12} already installed; waiting for ate-api-server..."
@@ -226,11 +336,20 @@ fi
 # 3. Deploy the AX namespace and gVisor WorkerPool.
 log "Deploying namespace '${AX_SYSTEM_NAMESPACE}' and WorkerPool (${AX_WORKER_REPLICAS} gVisor replicas)..."
 render_manifest namespace.yaml | k apply -f -
-(
-  cd "${SUBSTRATE_WORK_DIR}"
+if [[ -n "${SUBSTRATE_IMAGE_TAG}" ]]; then
+  # No-op after a fresh install; needed when the install above was skipped.
+  ensure_substrate_images
+  worker_ref="${REGISTRY_ADDR}/${WORKER_IMAGE}:${SUBSTRATE_IMAGE_TAG}@$(registry_digest "${WORKER_IMAGE}" "${SUBSTRATE_IMAGE_TAG}")"
   render_manifest workerpool.yaml |
-    KO_DOCKER_REPO="${REGISTRY_ADDR}" ./hack/run-tool.sh ko resolve --platform="linux/${GOARCH}" -f -
-) | k apply -f -
+    sed "s|${WORKER_KO_REF}|${worker_ref}|" |
+    k apply -f -
+else
+  (
+    cd "${SUBSTRATE_WORK_DIR}"
+    render_manifest workerpool.yaml |
+      KO_DOCKER_REPO="${REGISTRY_ADDR}" ./hack/run-tool.sh ko resolve --platform="linux/${GOARCH}" -f -
+  ) | k apply -f -
+fi
 
 log "Waiting for ax-workers to become Ready..."
 for _ in $(seq 1 60); do
@@ -252,7 +371,7 @@ log "Building ax (host), ax-server and ax-task-runner (linux/${GOARCH})..."
 
 log "Building and pushing images to ${REGISTRY_ADDR}..."
 AX_SERVER_IMAGE="$(build_and_push "${REGISTRY_ADDR}/ax-server:e2e" \
-  --build-arg TARGETARCH="${GOARCH}" -f "${E2E_DIR}/Dockerfile.server")"
+  --build-arg TARGETARCH="${GOARCH}" -f "${REPO_ROOT}/Dockerfile.server")"
 # The E2E task-runner image extends the production image with test fixtures.
 docker build -q -t "${REGISTRY_ADDR}/ax-task-runner:base" \
   --build-arg TARGETARCH="${GOARCH}" -f "${REPO_ROOT}/Dockerfile.task-runner" "${REPO_ROOT}" > /dev/null
@@ -261,13 +380,17 @@ AX_DEFAULT_TASK_IMAGE="$(build_and_push "${REGISTRY_ADDR}/ax-task-runner:e2e" \
 export AX_SERVER_IMAGE AX_DEFAULT_TASK_IMAGE
 printf '  AX_SERVER_IMAGE=%s\n  AX_DEFAULT_TASK_IMAGE=%s\n' "${AX_SERVER_IMAGE}" "${AX_DEFAULT_TASK_IMAGE}"
 
-# 5. Deploy Redis and ax-server. Delete existing deployments first so every
-#    run starts from empty Redis state.
-log "Deploying ax-redis and ax-server in namespace '${AX_SYSTEM_NAMESPACE}'..."
-k -n "${AX_SYSTEM_NAMESPACE}" delete deployment ax-redis ax-server --ignore-not-found
-render_manifest redis.yaml | k apply -f -
+# 5. Deploy Postgres and ax-server. Delete existing workloads and Postgres's
+#    volume first so every run starts from an empty database.
+log "Deploying ax-postgres and ax-server in namespace '${AX_SYSTEM_NAMESPACE}'..."
+k -n "${AX_SYSTEM_NAMESPACE}" delete deployment ax-server --ignore-not-found
+k -n "${AX_SYSTEM_NAMESPACE}" delete statefulset ax-postgres --ignore-not-found --wait
+k -n "${AX_SYSTEM_NAMESPACE}" delete pvc -l app.kubernetes.io/name=ax-postgres --ignore-not-found --wait
+k -n "${AX_SYSTEM_NAMESPACE}" create secret generic ax-postgres \
+  --from-literal=password="$(openssl rand -hex 24)" --dry-run=client -o yaml | k apply -f -
+render_manifest postgres.yaml | k apply -f -
+k -n "${AX_SYSTEM_NAMESPACE}" rollout status statefulset/ax-postgres --timeout=180s
 render_manifest ax-server.yaml | k apply -f -
-k -n "${AX_SYSTEM_NAMESPACE}" rollout status deployment/ax-redis --timeout=120s
 k -n "${AX_SYSTEM_NAMESPACE}" rollout status deployment/ax-server --timeout=120s
 
 # 6. Persist the environment for hack/run-e2e.sh and the Go test harness.
