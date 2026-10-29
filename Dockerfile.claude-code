@@ -14,9 +14,11 @@
 
 # Task image with Claude Code preinstalled.
 #
-# Extends the default ax-task-runner image, so the runner contract
-# (/usr/local/bin/ax-task-runner as PID 1, probes, metadata server) is
-# unchanged. Only the tools available to spec.command differ.
+# Extends the default ax-task-runner image and replaces its runner with
+# claude-code-runner (cmd/runners/claude-code-runner), installed at the same
+# /usr/local/bin/ax-task-runner path. A Task that leaves spec.command empty is
+# configured through spec.config, which holds the prompt and claude's flags:
+# the runner turns it into a headless `claude --print` session. A Task that sets spec.command runs it as usual.
 #
 #   make build-claude-code-image            # build locally
 #   make push-claude-code-image             # push and print the digest
@@ -31,7 +33,7 @@
 
 # Pinned to the same digest the examples use so runner behavior is
 # reproducible. Override with --build-arg BASE_IMAGE=... (or
-# CLAUDE_CODE_BASE_IMAGE= for the Makefile target) to build on your own runner.
+# CLAUDE_CODE_BASE_IMAGE= for the Makefile target) to build on another image.
 ARG BASE_IMAGE=gcr.io/ax-substrate/ate-images/ax-task-runner@sha256:3a0dea6ad8b55278685db58aca6e37dc4ba04056831d45bef3aaeafdca43cac6
 FROM ${BASE_IMAGE}
 
@@ -53,5 +55,8 @@ ENV IS_SANDBOX=1 \
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
     DISABLE_AUTOUPDATER=1
 
-# Keep the default runner entrypoint.
+# The Makefile cross-compiles the runner into bin/ before building the image.
+ARG TARGETARCH=amd64
+COPY bin/linux_${TARGETARCH}/claude-code-runner /usr/local/bin/ax-task-runner
+
 ENTRYPOINT ["/usr/local/bin/ax-task-runner"]

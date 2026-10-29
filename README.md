@@ -119,8 +119,6 @@ ax suspend task task123              # checkpoint and pause
 ax resume task task123               # pick up where it left off
 ```
 
-To run Claude Code against a repo, apply [`examples/claude-code.yaml`](examples/claude-code.yaml).
-
 Want to see the whole lifecycle end to end? Run [`./demo.sh`](demo.sh). It applies a custom workspace, waits for readiness, runs commands over `ax ssh`, and suspends the task.
 
 ## Documentation

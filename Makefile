@@ -99,8 +99,12 @@ define push_image
 	fi
 endef
 
-# Build a task image with Claude Code preinstalled, on top of the default runner image
+# Build a task image with Claude Code preinstalled and claude-code-runner as
+# its runner, on top of the default runner image
 build-claude-code-image:
+	@echo "==> Cross-compiling claude-code-runner for linux/amd64..."
+	@mkdir -p bin/linux_amd64
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/linux_amd64/claude-code-runner ./cmd/runners/claude-code-runner
 	@echo "==> Building container image $(CLAUDE_CODE_REPO):latest (Claude Code $(CLAUDE_CODE_VERSION)) using $(CONTAINER_CLI)..."
 	$(CONTAINER_CLI) build --platform linux/amd64 --build-arg CLAUDE_CODE_VERSION=$(CLAUDE_CODE_VERSION) $(if $(CLAUDE_CODE_BASE_IMAGE),--build-arg BASE_IMAGE=$(CLAUDE_CODE_BASE_IMAGE),) -t $(CLAUDE_CODE_REPO):latest -f Dockerfile.claude-code .
 
