@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/ax/internal/controller"
 	"github.com/google/ax/internal/lock"
@@ -33,6 +34,14 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+// lifecycleReconcileTimeout bounds the suspend/resume reconcile an RPC
+// triggers. The work runs on a context decoupled from the request, so a client
+// that times out or disconnects cannot abort it; this deadline is the only
+// bound. It is deliberately longer than the CLI's five-minute lifecycle RPC
+// timeout so a client giving up still leaves the server enough time to finish
+// the Substrate operation and write the resulting status back.
+const lifecycleReconcileTimeout = 10 * time.Minute
 
 // Options configures the AX API Server.
 type Options struct {
@@ -287,7 +296,14 @@ func (s *Server) SuspendTask(ctx context.Context, req *v1alpha1.SuspendTaskReque
 	}
 	task.Status.Phase = v1alpha1.PhaseSuspended
 
-	reconciled, err := s.reconciler.Reconcile(ctx, task, s.fetchWorkspace(ctx, atespace, task))
+	// The reconcile is not the client's to cancel: a client timeout or
+	// disconnect must not abandon a suspend that is already in flight on
+	// Substrate or skip the status write-back below. Keep the request's values
+	// but give the work its own deadline.
+	reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lifecycleReconcileTimeout)
+	defer cancel()
+
+	reconciled, err := s.reconciler.Reconcile(reconcileCtx, task, s.fetchWorkspace(reconcileCtx, atespace, task))
 	if err != nil {
 		if substrate.IsTransientError(err) {
 			return nil, status.Errorf(codes.Unavailable, "suspending task on substrate: %v", err)
@@ -295,12 +311,12 @@ func (s *Server) SuspendTask(ctx context.Context, req *v1alpha1.SuspendTaskReque
 		return nil, status.Errorf(codes.Internal, "suspending task on substrate: %v", err)
 	}
 	task.Status = reconciled.Status
-	if err := s.updateTask(ctx, atespace, taskName, task.Status); err != nil {
+	if err := s.updateTask(reconcileCtx, atespace, taskName, task.Status); err != nil {
 		return nil, status.Errorf(codes.Internal, "updating task status: %v", err)
 	}
 
 	// Report the actor as it is now, as GetTask would.
-	s.applyActor(ctx, task)
+	s.applyActor(reconcileCtx, task)
 	return task, nil
 }
 
@@ -333,7 +349,14 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 	}
 	task.Status.Phase = v1alpha1.PhaseRunning
 
-	reconciled, err := s.reconciler.Reconcile(ctx, task, s.fetchWorkspace(ctx, atespace, task))
+	// The reconcile is not the client's to cancel: a client timeout or
+	// disconnect must not abandon a restore that is already in flight on
+	// Substrate or skip the status write-back below. Keep the request's values
+	// but give the work its own deadline.
+	reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lifecycleReconcileTimeout)
+	defer cancel()
+
+	reconciled, err := s.reconciler.Reconcile(reconcileCtx, task, s.fetchWorkspace(reconcileCtx, atespace, task))
 	if err != nil {
 		if reconciled != nil && reconciled.Status != nil {
 			task.Status = reconciled.Status
@@ -343,19 +366,19 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 		} else if task.Status.Phase != v1alpha1.PhasePending {
 			task.Status.Phase = v1alpha1.PhaseFailed
 		}
-		_ = s.updateTask(ctx, atespace, taskName, task.Status)
+		_ = s.updateTask(reconcileCtx, atespace, taskName, task.Status)
 		if substrate.IsTransientError(err) {
 			return nil, status.Errorf(codes.Unavailable, "resuming task on substrate: %v", err)
 		}
 		return nil, status.Errorf(codes.Internal, "resuming task on substrate: %v", err)
 	}
 	task.Status = reconciled.Status
-	if err := s.updateTask(ctx, atespace, taskName, task.Status); err != nil {
+	if err := s.updateTask(reconcileCtx, atespace, taskName, task.Status); err != nil {
 		return nil, status.Errorf(codes.Internal, "updating task status: %v", err)
 	}
 
 	// Report the actor as it is now, as GetTask would.
-	s.applyActor(ctx, task)
+	s.applyActor(reconcileCtx, task)
 	return task, nil
 }
 

@@ -553,6 +553,181 @@ func TestServer_SuspendTask_SuccessUpdatesStoredState(t *testing.T) {
 	assertNoActorState(t, stored)
 }
 
+func TestServer_ResumeTask_CompletesAfterRequestCanceled(t *testing.T) {
+	st := memory.NewStore()
+	sub := substratetest.NewServer(t)
+	srv := server.NewServer(st, newTestReconciler(sub))
+	ctx := context.Background()
+
+	if _, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{Task: &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "task-resume-canceled"},
+		Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+	}}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	// Hold the Substrate resume until the request context has been canceled, as
+	// a slow restore would.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	sub.SetOnResumeActor(func() {
+		close(entered)
+		<-release
+	})
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := srv.ResumeTask(reqCtx, &v1alpha1.ResumeTaskRequest{Name: "task-resume-canceled"})
+		done <- err
+	}()
+
+	<-entered
+	cancel()
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("ResumeTask failed after the request context was canceled: %v", err)
+	}
+
+	actor, _ := sub.Actor("default", "task-resume-canceled")
+	if state := actor.GetStatus().GetState(); state != ateapipb.ActorState_ACTOR_STATE_RUNNING {
+		t.Errorf("actor state after ResumeTask = %v, want RUNNING", state)
+	}
+	got, err := srv.GetTask(ctx, &v1alpha1.GetTaskRequest{Name: "task-resume-canceled"})
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if got.GetStatus().GetPhase() != v1alpha1.PhaseRunning {
+		t.Errorf("phase after canceled ResumeTask = %q, want Running", got.GetStatus().GetPhase())
+	}
+	stored, err := st.GetTask(ctx, "default", "task-resume-canceled")
+	if err != nil {
+		t.Fatalf("store GetTask: %v", err)
+	}
+	assertNoActorState(t, stored)
+}
+
+func TestServer_SuspendTask_CompletesAfterRequestCanceled(t *testing.T) {
+	st := memory.NewStore()
+	sub := substratetest.NewServer(t)
+	srv := server.NewServer(st, newTestReconciler(sub))
+	ctx := context.Background()
+
+	if _, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{Task: &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "task-suspend-canceled"},
+		Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+	}}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if _, err := srv.ResumeTask(ctx, &v1alpha1.ResumeTaskRequest{Name: "task-suspend-canceled"}); err != nil {
+		t.Fatalf("ResumeTask: %v", err)
+	}
+
+	// Hold the Substrate suspend until the request context has been canceled.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	sub.SetOnSuspendActor(func() {
+		close(entered)
+		<-release
+	})
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := srv.SuspendTask(reqCtx, &v1alpha1.SuspendTaskRequest{Name: "task-suspend-canceled"})
+		done <- err
+	}()
+
+	<-entered
+	cancel()
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("SuspendTask failed after the request context was canceled: %v", err)
+	}
+
+	actor, _ := sub.Actor("default", "task-suspend-canceled")
+	if state := actor.GetStatus().GetState(); state != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+		t.Errorf("actor state after SuspendTask = %v, want SUSPENDED", state)
+	}
+	stored, err := st.GetTask(ctx, "default", "task-suspend-canceled")
+	if err != nil {
+		t.Fatalf("store GetTask: %v", err)
+	}
+	assertNoActorState(t, stored)
+}
+
+// cancelRecordingStore records the context error the server passed to the
+// last UpdateTaskStatus call. The in-memory store ignores its context, so this
+// shows whether the server tried to write status on a canceled context.
+type cancelRecordingStore struct {
+	store.Store
+	updateCtxErr error
+}
+
+func (s *cancelRecordingStore) UpdateTaskStatus(ctx context.Context, atespace, name string, status *v1alpha1.TaskStatus) error {
+	s.updateCtxErr = ctx.Err()
+	return s.Store.UpdateTaskStatus(ctx, atespace, name, status)
+}
+
+func TestServer_ResumeTask_WritesStatusAfterWorkspacePollCanceled(t *testing.T) {
+	// The workspace never becomes ready, so the reconcile is still polling when
+	// the request context is canceled, as it is when a client deadline expires.
+	probeStarted := make(chan struct{}, 1)
+	readySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case probeStarted <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer readySrv.Close()
+
+	st := &cancelRecordingStore{Store: memory.NewStore()}
+	sub := substratetest.NewServer(t)
+	sub.SetWorkerIP(readySrv.Listener.Addr().String())
+	rec := newTestReconciler(sub)
+	rec.WorkspaceReadyTimeout = time.Second
+	srv := server.NewServer(st, rec)
+	ctx := context.Background()
+
+	if _, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{Task: &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "task-poll-canceled"},
+		Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+	}}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := srv.ResumeTask(reqCtx, &v1alpha1.ResumeTaskRequest{Name: "task-poll-canceled"})
+		done <- err
+	}()
+
+	<-probeStarted
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("ResumeTask failed after the request context was canceled: %v", err)
+	}
+	if st.updateCtxErr != nil {
+		t.Errorf("status write-back used a canceled context: %v", st.updateCtxErr)
+	}
+
+	stored, err := st.GetTask(ctx, "default", "task-poll-canceled")
+	if err != nil {
+		t.Fatalf("store GetTask: %v", err)
+	}
+	var workspaceReady *v1alpha1.Condition
+	for _, c := range stored.GetStatus().GetConditions() {
+		if c.GetType() == v1alpha1.ConditionWorkspaceReady {
+			workspaceReady = c
+		}
+	}
+	if workspaceReady == nil || workspaceReady.GetReason() != v1alpha1.ReasonInitializing {
+		t.Errorf("stored WorkspaceReady condition = %v, want Initializing after the reconcile completed", workspaceReady)
+	}
+}
+
 // assertNoActorState checks that a stored task holds none of the status that
 // belongs to its actor on Substrate.
 func assertNoActorState(t *testing.T, stored *v1alpha1.Task) {

@@ -58,6 +58,8 @@ type Server struct {
 	workerIP         string                             // empty: resumed actors get no worker
 	errs             Errors
 	onDeleteActor    func()
+	onSuspendActor   func()
+	onResumeActor    func()
 	deleteActorCalls int
 }
 
@@ -112,6 +114,24 @@ func (s *Server) SetOnDeleteActor(fn func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.onDeleteActor = fn
+}
+
+// SetOnSuspendActor makes fn run at the start of every SuspendActor call,
+// before the actor changes state. fn runs without s.mu held, so it may call s
+// or block.
+func (s *Server) SetOnSuspendActor(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onSuspendActor = fn
+}
+
+// SetOnResumeActor makes fn run at the start of every ResumeActor call, before
+// the actor changes state. fn runs without s.mu held, so it may call s or
+// block.
+func (s *Server) SetOnResumeActor(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onResumeActor = fn
 }
 
 // SetActor stores a copy of actor, replacing any actor of the same name, as
@@ -251,9 +271,16 @@ func (s *Server) CreateActor(_ context.Context, req *ateapipb.CreateActorRequest
 
 func (s *Server) SuspendActor(_ context.Context, req *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error) {
 	s.mu.Lock()
+	onSuspend, suspendErr := s.onSuspendActor, s.errs.SuspendActor
+	s.mu.Unlock()
+	if onSuspend != nil {
+		onSuspend()
+	}
+
+	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.errs.SuspendActor != nil {
-		return nil, s.errs.SuspendActor
+	if suspendErr != nil {
+		return nil, suspendErr
 	}
 	actor, err := s.lookupActor(req.GetActor())
 	if err != nil {
@@ -265,9 +292,16 @@ func (s *Server) SuspendActor(_ context.Context, req *ateapipb.SuspendActorReque
 
 func (s *Server) ResumeActor(_ context.Context, req *ateapipb.ResumeActorRequest) (*ateapipb.ResumeActorResponse, error) {
 	s.mu.Lock()
+	onResume, resumeErr := s.onResumeActor, s.errs.ResumeActor
+	s.mu.Unlock()
+	if onResume != nil {
+		onResume()
+	}
+
+	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.errs.ResumeActor != nil {
-		return nil, s.errs.ResumeActor
+	if resumeErr != nil {
+		return nil, resumeErr
 	}
 	actor, err := s.lookupActor(req.GetActor())
 	if err != nil {
